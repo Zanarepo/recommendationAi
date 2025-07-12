@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 import os
 import pandas as pd
 from sklearn.ensemble import IsolationForest
@@ -9,6 +10,7 @@ import numpy as np
 from datetime import datetime, timezone
 import logging
 import traceback
+import atexit
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -49,7 +51,6 @@ def convert_to_python_types(obj):
 # Anomaly detection
 def detect_anomalies(store_id=None):
     try:
-        # Fetch limited sales data to reduce memory usage
         query = supabase.table("dynamic_sales").select("dynamic_product_id, store_id, quantity, sold_at").limit(500)
         if store_id:
             query = query.eq("store_id", store_id)
@@ -110,7 +111,6 @@ def detect_anomalies(store_id=None):
 # Analyze sales patterns for restock and avoid-restock recommendations
 def analyze_sales_patterns(store_id=None):
     try:
-        # Fetch limited sales data to reduce memory usage
         query = supabase.table("dynamic_sales").select("dynamic_product_id, store_id, quantity, sold_at").limit(500)
         if store_id:
             query = query.eq("store_id", store_id)
@@ -123,10 +123,7 @@ def analyze_sales_patterns(store_id=None):
         sales_df["month"] = sales_df["sold_at"].dt.to_period("M").astype(str)
         logger.debug(f"Sales patterns - Sales data shape: {sales_df.shape}, unique products: {len(sales_df['dynamic_product_id'].unique())}")
 
-        # Aggregate sales by product, store, and month
         monthly_sales = sales_df.groupby(["dynamic_product_id", "store_id", "month"])["quantity"].sum().reset_index()
-        
-        # Calculate thresholds for high/low sales
         mean_sales = monthly_sales["quantity"].mean()
         high_sales_threshold = mean_sales + monthly_sales["quantity"].std()
         low_sales_threshold = mean_sales - monthly_sales["quantity"].std()
@@ -141,7 +138,6 @@ def analyze_sales_patterns(store_id=None):
             product_name = product[0]["name"] if product and len(product) > 0 else f"Product ID: {product_id}"
             shop_name = store[0]["shop_name"] if store and len(store) > 0 else f"Store ID: {store_id}"
 
-            # Identify high/low sales and peak periods
             for _, row in product_data.iterrows():
                 quantity = row["quantity"]
                 month = row["month"]
@@ -178,7 +174,6 @@ def analyze_sales_patterns(store_id=None):
                         "created_at": datetime.now(timezone.utc).isoformat()
                     })
 
-        # Insert recommendations into Supabase
         if restock_recommendations or avoid_restock or high_demand_periods:
             logger.info(f"Inserting {len(restock_recommendations)} restock, {len(avoid_restock)} avoid restock, {len(high_demand_periods)} high-demand periods into Supabase")
             supabase.table("restock_recommendations").insert(restock_recommendations + avoid_restock + high_demand_periods).execute()
@@ -192,27 +187,53 @@ def analyze_sales_patterns(store_id=None):
         logger.error(f"Error in analyze_sales_patterns: {str(e)}\n{traceback.format_exc()}")
         raise
 
-# Recommendations endpoint
+# Scheduler function to run weekly
+def run_scheduled_recommendations():
+    try:
+        logger.info("Starting scheduled recommendations task")
+        anomalies = detect_anomalies()  # Run for all stores
+        sales_patterns = analyze_sales_patterns()
+        logger.info(f"Scheduled task completed: {len(anomalies)} anomalies, {len(sales_patterns['restock_recommendations'])} restock recommendations")
+    except Exception as e:
+        logger.error(f"Error in scheduled recommendations: {str(e)}\n{traceback.format_exc()}")
+
+# Set up BackgroundScheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(run_scheduled_recommendations, 'interval', days=7, next_run_time=datetime.now(timezone.utc))
+scheduler.start()
+logger.info("BackgroundScheduler started for weekly recommendations")
+
+# Shutdown scheduler gracefully
+atexit.register(lambda: scheduler.shutdown())
+
+# Recommendations endpoint (fetch precomputed data)
 @app.route('/recommendations', methods=['GET'])
 def recommendations_endpoint():
     try:
         store_id = request.args.get('store_id')
+        anomalies_query = supabase.table("anomalies").select("*").order("created_at", desc=True).limit(100)
+        recommendations_query = supabase.table("restock_recommendations").select("*").order("created_at", desc=True).limit(100)
         if store_id:
             try:
                 store_id = int(store_id)
-                logger.debug(f"Processing recommendations for store_id: {store_id}")
+                logger.debug(f"Fetching precomputed recommendations for store_id: {store_id}")
+                anomalies_query = anomalies_query.eq("store_id", store_id)
+                recommendations_query = recommendations_query.eq("store_id", store_id)
             except ValueError:
                 logger.error("Invalid store_id format")
                 return jsonify({"error": "Invalid store_id format"}), 400
-        anomalies = detect_anomalies(store_id)
-        sales_patterns = analyze_sales_patterns(store_id)
+        anomalies = anomalies_query.execute().data
+        recommendations = recommendations_query.execute().data
+        restock_recommendations = [r for r in recommendations if "Restock" in r["recommendation"]]
+        avoid_restock = [r for r in recommendations if "Purchase" in r["recommendation"]]
+        high_demand_periods = [r for r in recommendations if "High demand" in r["recommendation"]]
         response = {
             "anomalies": anomalies,
-            "restock_recommendations": sales_patterns["restock_recommendations"],
-            "avoid_restock": sales_patterns["avoid_restock"],
-            "high_demand_periods": sales_patterns["high_demand_periods"]
+            "restock_recommendations": restock_recommendations,
+            "avoid_restock": avoid_restock,
+            "high_demand_periods": high_demand_periods
         }
-        logger.debug(f"Recommendations endpoint response: {response}")
+        logger.debug(f"Recommendations endpoint response: {len(anomalies)} anomalies, {len(restock_recommendations)} restock recommendations")
         return jsonify(response), 200
     except Exception as e:
         logger.error(f"Error in /recommendations: {str(e)}\n{traceback.format_exc()}")
